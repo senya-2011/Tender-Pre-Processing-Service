@@ -1,0 +1,15 @@
+stateDiagram-v2
+  direction TB
+  [*] --> CREATED: РД принята
+  CREATED --> CATEGORIZING
+  CATEGORIZING --> SEARCHING: категории выделены
+  SEARCHING --> ANALYZING: страницы найдены
+  ANALYZING --> PRICING: покрытие оценено
+  PRICING --> READY: оценка рассчитана
+  READY --> READY: пересчёт
+  READY --> COMPLETED: письма отправлены
+  CATEGORIZING --> FAILED: ошибка
+  SEARCHING --> FAILED: сбой
+  ANALYZING --> FAILED: сбой
+  FAILED --> [*]
+  COMPLETED --> [*]

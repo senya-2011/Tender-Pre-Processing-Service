@@ -1,0 +1,37 @@
+flowchart TB
+  classDef mgr fill:#dbeafe,stroke:#2563eb,color:#111
+  classDef sys fill:#f1f5f9,stroke:#475569,color:#111
+  classDef ext fill:#ffedd5,stroke:#ea580c,color:#111
+  classDef ev fill:#ffffff,stroke:#111,stroke-width:2px,color:#111
+
+  subgraph P1["1. Загрузка и проверка"]
+    direction LR
+    A((Начало)):::ev --> B["Менеджер:<br/>загружает РД,<br/>регион, язык, маржа"]:::mgr
+    B --> C["Система:<br/>проверяет РД"]:::sys
+    C --> D{"РД<br/>корректна?"}
+    D -- нет --> X((("Конец:<br/>ошибка"))):::ev
+  end
+  subgraph P2["2. Поиск и анализ поставщиков"]
+    direction LR
+    E["Система:<br/>группирует позиции<br/>по категориям"]:::sys --> F["Tavily:<br/>поиск поставщиков"]:::ext
+    F --> G["DeepSeek:<br/>анализ страниц<br/>и покрытия"]:::ext
+    G --> H["Price Parser:<br/>прайс-листы"]:::ext
+    H --> I["Система:<br/>список и оценка<br/>стоимости"]:::sys
+  end
+  subgraph P3["3. Проверка менеджером"]
+    direction LR
+    J["Менеджер:<br/>просматривает<br/>список"]:::mgr --> K{"Список<br/>устраивает?"}
+    K -- нет --> L["Менеджер:<br/>удаляет или<br/>добавляет"]:::mgr
+    L --> M["Система:<br/>пересчитывает<br/>оценку"]:::sys
+    M --> J
+    K -- да --> N["Менеджер:<br/>смотрит оценку<br/>стоимости"]:::mgr
+  end
+  subgraph P4["4. Запрос КП"]
+    direction LR
+    O["Система:<br/>формирует<br/>черновики писем"]:::sys --> P["Менеджер:<br/>правит и<br/>отправляет"]:::mgr
+    P --> Q["Система и SMTP:<br/>отправка,<br/>статусы"]:::sys
+    Q --> Z((("Конец:<br/>запросы<br/>отправлены"))):::ev
+  end
+  P1 -- "РД корректна" --> P2
+  P2 --> P3
+  P3 --> P4

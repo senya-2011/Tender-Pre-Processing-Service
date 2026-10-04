@@ -1,0 +1,30 @@
+sequenceDiagram
+  autonumber
+  actor M as Менеджер (UI)
+  participant S as sourcing-service
+  participant K as Kafka
+  participant ML as mailer-service
+  participant SMTP as SMTP-сервер
+
+  M->>S: Отклонить поставщика
+  S-->>M: Пересчитанная оценка
+  M->>S: Открыть письма
+  S->>S: Собрать позиции по категориям
+  S-->>M: Черновики писем
+  M->>S: Правки текста, «Отправить»
+  S->>K: rfq.send.requested
+  S-->>M: 202, статус QUEUED
+  K->>ML: rfq.send.requested
+  ML->>SMTP: Отправить письмо
+  alt отправлено
+    SMTP-->>ML: OK
+    ML->>K: rfq.status.changed (SENT)
+  else ошибка
+    SMTP-->>ML: Ошибка
+    ML->>ML: Повтор до 3 раз
+    ML->>K: rfq.status.changed (FAILED)
+  end
+  K->>S: rfq.status.changed
+  S->>S: Сохранить статус
+  M->>S: Статусы писем
+  S-->>M: SENT или FAILED

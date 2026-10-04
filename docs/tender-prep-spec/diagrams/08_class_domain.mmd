@@ -1,0 +1,54 @@
+classDiagram
+  direction LR
+  class TenderJob {
+    +UUID id
+    +String name
+    +Region region
+    +Language language
+    +BigDecimal marginPercent
+    +JobStatus status
+  }
+  class Category {
+    +String name
+    +int positionsCount
+  }
+  class Position {
+    +int itemIndex
+    +String rawName
+    +String groupKsr
+    +BigDecimal quantity
+  }
+  class Supplier {
+    +String name
+    +String website
+    +String email
+    +String phone
+  }
+  class SupplierCandidate {
+    +CandidateStatus status
+    +int coveredPositions
+    +BigDecimal avgPriceUsd
+    +Confidence confidence
+  }
+  class Estimate {
+    +BigDecimal baseTotalUsd
+    +BigDecimal marginUsd
+    +BigDecimal totalUsd
+    +Confidence confidence
+  }
+  class RfqDraft {
+    +String subject
+    +String body
+    +Language language
+  }
+  class RfqMessage {
+    +MessageStatus status
+    +int attempts
+  }
+  TenderJob "1" o-- "*" Category
+  Category "1" o-- "*" Position
+  TenderJob "1" o-- "*" SupplierCandidate
+  Supplier "1" <-- "*" SupplierCandidate
+  TenderJob "1" o-- "0..1" Estimate
+  SupplierCandidate "1" --> "0..1" RfqDraft
+  RfqDraft "1" --> "0..1" RfqMessage

@@ -1,0 +1,28 @@
+flowchart LR
+  M(("Менеджер<br/>по закупкам"))
+  subgraph SYS["Tender Pre-Processing Service"]
+    direction TB
+    UC1(["UC-1<br/>Загрузить РД и запустить обработку"])
+    UC2(["UC-2<br/>Просмотреть список поставщиков"])
+    UC3(["UC-3<br/>Отредактировать список"])
+    UC4(["UC-4<br/>Получить оценку стоимости"])
+    UC5(["UC-5<br/>Подготовить и отправить запросы КП"])
+    UC6(["UC-6<br/>Отследить статусы отправки"])
+  end
+  EXT1["Tavily API<br/>DeepSeek API"]
+  EXT2["Price Parser Service"]
+  EXT3["SMTP-сервер"]
+
+  M --- UC1
+  M --- UC2
+  M --- UC3
+  M --- UC4
+  M --- UC5
+  M --- UC6
+  UC2 -. "include" .-> UC1
+  UC3 -. "extend" .-> UC2
+  UC4 -. "include" .-> UC2
+  UC6 -. "extend" .-> UC5
+  UC1 --- EXT1
+  UC1 --- EXT2
+  UC5 --- EXT3

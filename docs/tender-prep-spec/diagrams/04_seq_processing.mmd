@@ -1,0 +1,37 @@
+sequenceDiagram
+  autonumber
+  actor M as Менеджер (UI)
+  participant S as sourcing-service
+  participant R as Redis
+  participant T as Tavily
+  participant D as DeepSeek
+  participant P as Price Parser
+
+  M->>S: Загрузить РД, регион, язык, маржа
+  S->>S: Проверить структуру РД
+  alt РД некорректна
+    S-->>M: 400, описание ошибки
+  else РД корректна
+    S-->>M: 202, jobId
+    loop для каждой категории
+      S->>R: Есть в кэше?
+      alt нет в кэше
+        S->>T: Поиск: категория и регион
+        T-->>S: Страницы с текстом
+        S->>D: Поставщик? Контакты? Покрытие?
+        D-->>S: JSON с результатом
+        S->>R: Сохранить в кэш
+      else есть в кэше
+        R-->>S: Результат из кэша
+      end
+    end
+    S->>S: Объединить дубликаты, покрытие
+    S->>P: Сайты поставщиков
+    P-->>S: Прайс-листы (JSON)
+    S->>S: Рассчитать оценку стоимости
+    loop пока статус не READY
+      M->>S: GET /jobs/{id}
+      S-->>M: Статус и прогресс
+    end
+    S-->>M: Список поставщиков и оценка
+  end

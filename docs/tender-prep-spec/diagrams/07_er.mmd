@@ -1,0 +1,113 @@
+erDiagram
+  TENDER_JOB ||--o{ POSITION : "содержит"
+  TENDER_JOB ||--o{ CATEGORY : "делится на"
+  CATEGORY ||--o{ POSITION : "группирует"
+  TENDER_JOB ||--o{ SUPPLIER_CANDIDATE : "предлагает"
+  SUPPLIER ||--o{ SUPPLIER_CANDIDATE : "выступает как"
+  SUPPLIER_CANDIDATE ||--o{ CANDIDATE_COVERAGE : "покрывает"
+  CATEGORY ||--o{ CANDIDATE_COVERAGE : "покрыта в"
+  SUPPLIER ||--o{ PRICE_ITEM : "прайс-лист"
+  TENDER_JOB ||--o| ESTIMATE : "оценка"
+  ESTIMATE ||--o{ ESTIMATE_LINE : "состоит из"
+  CATEGORY ||--o{ ESTIMATE_LINE : "по категории"
+  SUPPLIER_CANDIDATE ||--o| RFQ_DRAFT : "запрос КП"
+  RFQ_DRAFT ||--o| RFQ_MESSAGE : "отправлен как"
+
+  TENDER_JOB {
+    uuid id PK
+    string name
+    string region "RU, MD, EU"
+    string language "ru, ro, en"
+    numeric margin_percent
+    string status
+    timestamp created_at
+  }
+  CATEGORY {
+    uuid id PK
+    uuid job_id FK
+    string name "group"
+    int positions_count
+  }
+  POSITION {
+    uuid id PK
+    uuid job_id FK
+    uuid category_id FK
+    int item_index
+    string detail_number
+    string raw_name
+    string group_ksr
+    numeric quantity
+    jsonb params
+  }
+  SUPPLIER {
+    uuid id PK
+    string name
+    string website UK
+    string email
+    string phone
+    string region
+    string source "TAVILY, MANUAL"
+    string parser_site_id
+    timestamp prices_synced_at
+  }
+  SUPPLIER_CANDIDATE {
+    uuid id PK
+    uuid job_id FK
+    uuid supplier_id FK
+    string status "PROPOSED, CONFIRMED, REJECTED"
+    int covered_positions
+    numeric avg_price_usd
+    string confidence
+    string evidence_url
+  }
+  CANDIDATE_COVERAGE {
+    uuid candidate_id FK
+    uuid category_id FK
+    int covered_positions
+    string confidence
+  }
+  PRICE_ITEM {
+    uuid id PK
+    uuid supplier_id FK
+    string name
+    string unit
+    numeric price
+    string currency
+    timestamp fetched_at
+  }
+  ESTIMATE {
+    uuid id PK
+    uuid job_id FK
+    numeric base_total_usd
+    numeric margin_percent
+    numeric margin_usd
+    numeric total_usd
+    numeric low_usd
+    numeric high_usd
+    string confidence
+  }
+  ESTIMATE_LINE {
+    uuid id PK
+    uuid estimate_id FK
+    uuid category_id FK
+    int priced_positions
+    numeric subtotal_usd
+  }
+  RFQ_DRAFT {
+    uuid id PK
+    uuid candidate_id FK
+    string language
+    string subject
+    text body
+    jsonb positions
+    string status
+  }
+  RFQ_MESSAGE {
+    uuid id PK
+    uuid draft_id "без FK, другая БД"
+    string to_email
+    string status "QUEUED, SENT, FAILED"
+    int attempts
+    string error
+    timestamp sent_at
+  }

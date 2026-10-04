@@ -1,0 +1,32 @@
+flowchart TB
+  subgraph CLIENT["Клиент"]
+    UI["Web UI (React)"]
+  end
+  subgraph TPS["Tender Pre-Processing Service"]
+    direction LR
+    SRC["sourcing-service<br/>Kotlin, Spring Boot"]
+    KAFKA{{"Apache Kafka"}}
+    MAIL["mailer-service<br/>Kotlin, Spring Boot"]
+    DB1[("PostgreSQL<br/>sourcing_db")]
+    REDIS[("Redis<br/>кэш")]
+    DB2[("PostgreSQL<br/>mailer_db")]
+    DB1 --- SRC
+    REDIS --- SRC
+    SRC --- KAFKA --- MAIL
+    MAIL --- DB2
+  end
+  subgraph EXT["Внешние системы"]
+    direction LR
+    TAV["Tavily API"]
+    DS["DeepSeek API"]
+    PARSER["Price Parser Service"]
+    SMTP["SMTP-сервер"]
+  end
+  SUP(["Поставщики<br/>получатели писем"])
+
+  UI -->|"REST, OpenAPI"| SRC
+  SRC -->|HTTPS| TAV
+  SRC -->|HTTPS| DS
+  SRC <-->|"REST: сайты, прайс-листы"| PARSER
+  MAIL -->|SMTP| SMTP
+  SMTP -.->|"письмо с запросом КП"| SUP

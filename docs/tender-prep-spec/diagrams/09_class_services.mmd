@@ -1,0 +1,51 @@
+classDiagram
+  direction TB
+  class JobController
+  class SupplierController
+  class RfqController
+  class JobOrchestrator
+  class RdValidator
+  class RdCategorizer
+  class SupplierDiscoveryService
+  class CoverageAnalyzer
+  class PriceSyncService
+  class CostEstimator
+  class RfqDraftService
+  class RfqEventPublisher
+  class RfqStatusListener
+  class TavilyClient {
+    <<client>>
+  }
+  class DeepSeekClient {
+    <<client>>
+  }
+  class PriceParserClient {
+    <<client>>
+  }
+  class RfqSendListener {
+    <<mailer-service>>
+  }
+  class MailRenderer {
+    <<mailer-service>>
+  }
+  class SmtpMailSender {
+    <<mailer-service>>
+  }
+
+  JobController --> JobOrchestrator
+  SupplierController --> CostEstimator
+  RfqController --> RfqDraftService
+  RfqController --> RfqEventPublisher
+  JobOrchestrator --> RdValidator
+  JobOrchestrator --> RdCategorizer
+  JobOrchestrator --> SupplierDiscoveryService
+  JobOrchestrator --> CoverageAnalyzer
+  JobOrchestrator --> PriceSyncService
+  JobOrchestrator --> CostEstimator
+  SupplierDiscoveryService --> TavilyClient
+  CoverageAnalyzer --> DeepSeekClient
+  PriceSyncService --> PriceParserClient
+  RfqEventPublisher ..> RfqSendListener : Kafka
+  RfqSendListener --> MailRenderer
+  RfqSendListener --> SmtpMailSender
+  RfqSendListener ..> RfqStatusListener : Kafka

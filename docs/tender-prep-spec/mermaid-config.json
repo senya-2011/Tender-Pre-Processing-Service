@@ -1,0 +1,9 @@
+{
+  "htmlLabels": false,
+  "theme": "neutral",
+  "themeVariables": { "fontFamily": "Helvetica, Arial, sans-serif", "fontSize": "15px" },
+  "flowchart": { "htmlLabels": false, "curve": "basis", "nodeSpacing": 40, "rankSpacing": 50 },
+  "sequence": { "useMaxWidth": true, "mirrorActors": false, "showSequenceNumbers": false },
+  "er": { "useMaxWidth": true },
+  "class": { "htmlLabels": false }
+}
