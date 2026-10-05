@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Kotlin / Gradle / Maven
+.gradle/
+**/build/classes/
+**/build/libs/
+**/build/tmp/
+**/build/reports/
+**/build/test-results/
+target/
+out/
+
+# Node
+node_modules/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
