@@ -1,0 +1,1562 @@
+openapi: 3.0.3
+info:
+  title: Sourcing Service API (Tender Pre-Processing Service)
+  version: 1.0.3
+  description: |
+    Единая REST-точка входа веб-интерфейса менеджера по закупкам для Tender Pre-Processing Service (TPS).
+
+    Сервис принимает рабочую документацию (РД, JSON), группирует позиции по категориям, ищет потенциальных
+    поставщиков (Tavily + DeepSeek), получает прайс-листы через Price Parser Service, рассчитывает оценку
+    порядка стоимости и готовит/отправляет письма-запросы КП. Отправка писем выполняется асинхронно через
+    Kafka и mailer-service; статусы возвращаются обратно в sourcing-service.
+
+    Общие правила:
+    - Авторизация в первой версии не требуется (единственная роль — менеджер по закупкам), поэтому
+      `security` не задаётся. Сервис не должен публиковаться во внешнюю сеть без проксирования.
+    - Все идентификаторы — UUID. Все даты и время — `date-time` (RFC 3339, UTC).
+    - Денежные суммы и курсы — `number` без `format` (в Kotlin генерируется `BigDecimal`), возвращаются в USD всегда и дополнительно в валюте региона (RU — RUB, MD — MDL, EU — EUR).
+      Оценка стоимости — ориентир порядка величины, а не ценовое предложение (BR-005).
+    - Все ошибки возвращаются в формате `ErrorResponse` с машинным кодом `code`.
+
+tags:
+  - name: system
+    description: Служебные эндпоинты
+  - name: jobs
+    description: Задачи обработки РД, категории и прогресс
+  - name: suppliers
+    description: Кандидаты-поставщики задачи и их редактирование
+  - name: estimate
+    description: Оценка порядка стоимости и курсы валют
+  - name: rfq
+    description: Черновики и отправка писем-запросов КП
+
+paths:
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Проверка живости сервиса
+      description: |
+        Процесс жив и отвечает. Не проверяет PostgreSQL, Redis, Kafka и внешние сервисы.
+      tags: [system]
+      responses:
+        "200":
+          description: Сервис запущен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "500":
+          description: |
+            Сервис не может обработать запрос из-за внутренней ошибки, код `INTERNAL_ERROR`.
+            Означает, что процесс запущен, но неисправен; оркестратор должен перезапустить контейнер.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /ready:
+    get:
+      operationId: readyCheck
+      summary: Проверка готовности сервиса
+      description: |
+        Проверяет обязательные зависимости: PostgreSQL, Kafka. Redis (кэш) не является обязательным —
+        его недоступность отражается как `degraded`, но не приводит к 503.
+        Внешние API (Tavily, DeepSeek, Price Parser) не проверяются, чтобы не расходовать лимиты.
+      tags: [system]
+      responses:
+        "200":
+          description: Все обязательные зависимости доступны
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: Хотя бы одна обязательная зависимость недоступна (PostgreSQL или Kafka); в теле перечислены зависимости и их состояние, трафик на сервис направлять нельзя
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs:
+    post:
+      operationId: createJob
+      summary: Загрузить РД и создать задачу обработки
+      description: |
+        Принимает файл РД (JSON-объект с массивом `products`) и параметры задачи, проверяет структуру и размер
+        файла (FR-001, FR-002, SEC-002), создаёт задачу в статусе `CREATED` и запускает асинхронную обработку.
+        Ответ 202 содержит задачу; ход обработки отслеживается через `getJob`.
+
+        Ограничения: размер файла не более 10 МБ (настраивается), content-type файла `application/json`.
+        Цены в РД не обязательны; `region`, `language` и `marginPercent` в файле РД не хранятся и задаются здесь.
+      tags: [jobs]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/JobCreateRequest"
+            encoding:
+              file:
+                contentType: application/json
+      responses:
+        "202":
+          description: Задача создана, обработка запущена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenderJob"
+        "400":
+          description: |
+            Файл РД не является корректным JSON или не проходит проверку структуры.
+            Коды: `RD_INVALID_JSON`, `RD_INVALID_FIELD` (в `details[].field` указан путь к полю,
+            например `products[12].quantity`), `RD_EMPTY` (массив `products` пуст).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidField:
+                  summary: Некорректное поле позиции
+                  value:
+                    code: RD_INVALID_FIELD
+                    message: Файл РД не прошёл проверку структуры
+                    details:
+                      - field: products[12].quantity
+                        message: Ожидается число, получена строка
+        "413":
+          description: Размер файла превышает допустимый (по умолчанию 10 МБ), код `FILE_TOO_LARGE`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: Неподдерживаемый тип содержимого файла, код `UNSUPPORTED_MEDIA_TYPE`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: |
+            Параметры задачи некорректны (неизвестные `region`/`language`, `marginPercent` вне диапазона,
+            пустое `name`), код `VALIDATION_ERROR`; поле указано в `details[].field`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+    get:
+      operationId: listJobs
+      summary: Список задач (история обработки)
+      description: |
+        Возвращает задачи, отсортированные по дате создания по убыванию (FR-018).
+        Список постраничный, чтобы ограничить размер ответа.
+      tags: [jobs]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница задач
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: getJob
+      summary: Статус и прогресс задачи
+      description: |
+        Возвращает статус задачи, прогресс по этапам (FR-019) и предупреждения о частичных сбоях
+        внешних сервисов (REL-001). Для статуса `FAILED` заполнено `failureReason`.
+      tags: [jobs]
+      responses:
+        "200":
+          description: Задача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenderJob"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/categories:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: listJobCategories
+      summary: Категории РД и число позиций
+      description: Категории (`group`) с вложенными подкатегориями (`group_ksr`) и числом позиций (FR-003).
+      tags: [jobs]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница категорий
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CategoryPage"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/suppliers:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: listJobSuppliers
+      summary: Список поставщиков задачи с покрытием
+      description: |
+        Возвращает всех кандидатов задачи, включая отклонённые (`REJECTED`), чтобы менеджер мог вернуть
+        поставщика в список (FR-008, FR-010). Результат может быть частичным, пока задача не в статусе `READY`.
+      tags: [suppliers]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница кандидатов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupplierCandidatePage"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+    post:
+      operationId: addJobSupplier
+      summary: Добавить поставщика вручную
+      description: |
+        Добавляет поставщика (название, сайт, e-mail) в задачу со статусом кандидата `CONFIRMED`;
+        оценка пересчитывается (FR-010, UC-3).
+
+        Реестр поставщиков единый: запись поставщика (по домену сайта) не дублируется. Если поставщик
+        с таким доменом уже есть в реестре, создаётся только кандидат на существующую запись, а переданные
+        `name` и `email`, а также `source` существующей записи не перезаписываются. Новая запись создаётся
+        с источником `MANUAL`, и её сайт передаётся в Price Parser Service.
+        Доступно, когда задача находится в статусе `READY`.
+      tags: [suppliers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddSupplierRequest"
+      responses:
+        "201":
+          description: Поставщик добавлен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupplierCandidate"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: |
+            Конфликт: поставщик с таким доменом уже есть в задаче (`SUPPLIER_DUPLICATE`)
+            либо задача ещё не в статусе `READY` (`JOB_NOT_READY`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Сайт или e-mail указан некорректно, код `VALIDATION_ERROR`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/suppliers/{candidateId}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - $ref: "#/components/parameters/CandidateId"
+    get:
+      operationId: getJobSupplier
+      summary: Карточка поставщика
+      description: |
+        Карточка кандидата с контактами, покрытием по категориям и ссылкой-источником `evidenceUrl`,
+        по которой поставщик найден (UC-2, п. 3).
+      tags: [suppliers]
+      responses:
+        "200":
+          description: Кандидат
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupplierCandidate"
+        "404":
+          $ref: "#/components/responses/CandidateNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+    patch:
+      operationId: updateJobSupplier
+      summary: Подтвердить, отклонить или изменить контакты поставщика
+      description: |
+        Меняет статус кандидата (`CONFIRMED`, `REJECTED`, `PROPOSED`) и/или e-mail поставщика
+        (UC-5, альтернативный поток 2а — указать адрес для неотправляемого письма).
+        Передаётся хотя бы одно поле. Любое изменение статуса приводит к пересчёту оценки (FR-011).
+        E-mail относится к единой записи поставщика в реестре: новое значение (последнее побеждает)
+        видно во всех задачах, где этот поставщик есть. Обновляет отправляемость черновиков письма,
+        но не меняет уже отправленные письма.
+      tags: [suppliers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCandidateRequest"
+      responses:
+        "200":
+          description: Обновлённый кандидат
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupplierCandidate"
+        "404":
+          $ref: "#/components/responses/CandidateNotFound"
+        "409":
+          description: Задача не в статусе `READY`, код `JOB_NOT_READY`; изменения во время обработки запрещены
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Тело запроса некорректно (пустое, неизвестный статус, некорректный e-mail), код `VALIDATION_ERROR`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/estimate:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: getJobEstimate
+      summary: Оценка порядка стоимости
+      description: |
+        Рассчитывает и возвращает оценку по активным поставщикам (`PROPOSED` и `CONFIRMED`, без `REJECTED`): базовая сумма,
+        маржа отдельной строкой, итог, диапазон и уровень уверенности (FR-011, BR-001…BR-003).
+        Суммы — в USD и в валюте региона задачи (FR-012).
+
+        Параметр `margin` переопределяет процент маржи только для этого расчёта и не меняет
+        значение, сохранённое в задаче (UC-4, п. 4).
+      tags: [estimate]
+      parameters:
+        - $ref: "#/components/parameters/Margin"
+      responses:
+        "200":
+          description: Оценка
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Estimate"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: |
+            Оценка недоступна: задача ещё не в статусе `READY` (`JOB_NOT_READY`)
+            или все поставщики отклонены либо список пуст (`NO_ACTIVE_SUPPLIERS`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Параметр `margin` вне диапазона 0…100, код `VALIDATION_ERROR`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/exchange-rates:
+    get:
+      operationId: listExchangeRates
+      summary: Справочник курсов валют
+      description: |
+        Курсы USD к RUB, MDL и EUR, используемые для отображения сумм в валюте региона (раздел «Данные» ТЗ).
+      tags: [estimate]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница курсов валют
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExchangeRatePage"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/rfq-drafts:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: listRfqDrafts
+      summary: Черновики писем-запросов КП
+      description: |
+        Только читает сохранённые черновики задачи (FR-013, I18N-001); побочных эффектов не имеет.
+        Если черновики ещё не сформированы, возвращается пустой список — их создаёт `generateRfqDrafts`.
+        В письмо попадают только позиции категорий, покрываемых поставщиком (BR-004).
+      tags: [rfq]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница черновиков
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RfqDraftPage"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: Задача ещё не в статусе `READY`, код `JOB_NOT_READY`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+    post:
+      operationId: generateRfqDrafts
+      summary: Сформировать черновики писем
+      description: |
+        Формирует черновики по поставщикам задачи на языке задачи; позиции берутся из категорий,
+        покрываемых поставщиком (BR-004). Выделено из `listRfqDrafts`, чтобы GET не менял данные.
+
+        Правила: черновики со статусом `DRAFT` пересобираются; отредактированные менеджером и уже
+        поставленные в очередь или отправленные не перезаписываются. Для кандидата `REJECTED` черновик
+        не создаётся, а существующий получает `sendable=false`.
+      tags: [rfq]
+      responses:
+        "201":
+          description: Черновики сформированы
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RfqDraft"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: Задача не в статусе `READY`, код `JOB_NOT_READY`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/rfq-drafts/{draftId}:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    put:
+      operationId: updateRfqDraft
+      summary: Изменить тему и текст письма
+      description: |
+        Полностью заменяет тему и текст черновика (FR-014). Редактирование доступно, пока письмо не
+        поставлено в очередь, то есть в статусах `DRAFT` и `FAILED`.
+      tags: [rfq]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRfqDraftRequest"
+      responses:
+        "200":
+          description: Обновлённый черновик
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RfqDraft"
+        "404":
+          $ref: "#/components/responses/DraftNotFound"
+        "409":
+          description: Письмо уже в очереди или отправлено, код `DRAFT_NOT_EDITABLE`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Тема или текст пусты либо превышают допустимую длину, код `VALIDATION_ERROR`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/rfq-drafts/{draftId}/retry:
+    parameters:
+      - $ref: "#/components/parameters/DraftId"
+    post:
+      operationId: retryRfqDraft
+      summary: Повторить отправку письма с ошибкой
+      description: |
+        Повторно ставит в очередь письмо в статусе `FAILED` (UC-6, п. 3). Создаёт новое сообщение
+        с новым `messageId`, чтобы идемпотентность по идентификатору письма (REL-002) не блокировала повтор.
+      tags: [rfq]
+      responses:
+        "202":
+          description: Письмо поставлено в очередь
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RfqMessage"
+        "404":
+          $ref: "#/components/responses/DraftNotFound"
+        "409":
+          description: Черновик не в статусе `FAILED`, код `DRAFT_NOT_FAILED`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: У поставщика не указан e-mail, код `DRAFT_NOT_SENDABLE`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+  /api/v1/jobs/{jobId}/rfq/send:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    post:
+      operationId: sendRfq
+      summary: Отправить выбранные письма
+      description: |
+        Ставит выбранные черновики в очередь отправки (FR-015): публикует `rfq.send.requested` в Kafka;
+        фактическую отправку по SMTP выполняет mailer-service. Для одного письма передайте один идентификатор.
+
+        Операция атомарна: если хотя бы один черновик не может быть отправлен (нет e-mail, уже в очереди или
+        отправлен, принадлежит другой задаче), ни одно письмо не ставится в очередь, а ответ содержит
+        список проблемных черновиков в `details`.
+      tags: [rfq]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendRfqRequest"
+      responses:
+        "202":
+          description: Письма поставлены в очередь (статус `QUEUED`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendRfqResponse"
+        "404":
+          description: Задача (`JOB_NOT_FOUND`) не найдена либо один из черновиков не найден или не принадлежит задаче (`DRAFT_NOT_FOUND`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: |
+            Задача не в статусе `READY` (`JOB_NOT_READY`) либо один из черновиков уже в очереди
+            или отправлен (`DRAFT_ALREADY_QUEUED`; в `details[].field` указан `draftIds[n]`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: |
+            Список пуст или слишком длинный (`VALIDATION_ERROR`), либо у поставщика нет e-mail
+            (`DRAFT_NOT_SENDABLE`; в `details[].field` указан `draftIds[n]`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+        "503":
+          description: Очередь отправки (Kafka) недоступна, код `QUEUE_UNAVAILABLE`; письма не поставлены в очередь
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/jobs/{jobId}/rfq/messages:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      operationId: listRfqMessages
+      summary: Статусы отправленных писем
+      description: |
+        Возвращает все сообщения задачи, включая историю повторов (по `attemptNo`), со статусами `QUEUED`, `SENT`, `FAILED`, числом попыток и причиной ошибки
+        (FR-016, UC-6). Статус обновляется по событиям `rfq.status.changed`; пока событие не получено,
+        возвращается `QUEUED`.
+      tags: [rfq]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Страница сообщений
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RfqMessagePage"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "404":
+          $ref: "#/components/responses/JobNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        default:
+          $ref: "#/components/responses/UnexpectedError"
+
+components:
+
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      description: Идентификатор задачи обработки
+      schema:
+        type: string
+        format: uuid
+    CandidateId:
+      name: candidateId
+      in: path
+      required: true
+      description: Идентификатор кандидата-поставщика в рамках задачи
+      schema:
+        type: string
+        format: uuid
+    DraftId:
+      name: draftId
+      in: path
+      required: true
+      description: Идентификатор черновика письма
+      schema:
+        type: string
+        format: uuid
+    Margin:
+      name: margin
+      in: query
+      required: false
+      description: |
+        Процент маржи подрядчика для расчёта (0…100). По умолчанию используется значение,
+        сохранённое в задаче.
+      schema:
+        type: number
+        minimum: 0
+        maximum: 100
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Максимальное число элементов на странице
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Смещение от начала списка
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  responses:
+    JobNotFound:
+      description: Задача не найдена, код `JOB_NOT_FOUND`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    CandidateNotFound:
+      description: Задача (`JOB_NOT_FOUND`) или кандидат (`CANDIDATE_NOT_FOUND`) не найдены
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DraftNotFound:
+      description: Черновик письма не найден, код `DRAFT_NOT_FOUND`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unprocessable:
+      description: Параметры запроса некорректны, код `VALIDATION_ERROR`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnexpectedError:
+      description: |
+        Прочие ошибки: `400` с кодом `VALIDATION_ERROR` при некорректном формате path/query-параметра
+        (например, идентификатор не UUID), а также ошибки прокси (`429`, `502`, `504`), которые прокси
+        обязан отдавать в этом же формате.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Внутренняя ошибка сервиса, код `INTERNAL_ERROR`; подробности в журнале сервиса, не в ответе
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+
+    # ------------------------------------------------------------------ перечисления
+
+    Region:
+      type: string
+      description: Регион закупки; определяет язык поисковых запросов и валюту отображения (BR-001)
+      enum: [RU, MD, EU]
+    Language:
+      type: string
+      description: Язык писем-запросов КП (I18N-001)
+      enum: [ru, ro, en]
+    LocalCurrency:
+      type: string
+      description: Валюта региона для отображения сумм вместе с USD (RU — RUB, MD — MDL, EU — EUR)
+      enum: [RUB, MDL, EUR]
+    JobStatus:
+      type: string
+      description: |
+        Состояние задачи (диаграмма состояний ТЗ). `CREATED` — РД принята; `CATEGORIZING`, `SEARCHING`,
+        `ANALYZING`, `PRICING` — этапы обработки; `READY` — список поставщиков получен, задача готова
+        к проверке (допускает пересчёт); `FAILED` — обработка прервана ошибкой.
+        Отправка писем на статус задачи не влияет: состояние писем хранится у самих писем (`DraftStatus`,
+        `MessageStatus`). Состояние `COMPLETED` из диаграммы ТЗ в контракт не включено.
+      enum: [CREATED, CATEGORIZING, SEARCHING, ANALYZING, PRICING, READY, FAILED]
+    StageName:
+      type: string
+      description: Этап обработки, отображаемый в прогрессе (FR-019)
+      enum: [CATEGORIZING, SEARCHING, ANALYZING, PRICING]
+    StageStatus:
+      type: string
+      description: |
+        Состояние этапа: `PENDING` — не начат; `RUNNING` — выполняется; `DONE` — завершён;
+        `PARTIAL` — завершён с частичными данными из-за сбоя внешнего сервиса (REL-001); `FAILED` — прерван.
+      enum: [PENDING, RUNNING, DONE, PARTIAL, FAILED]
+    CandidateStatus:
+      type: string
+      description: |
+        Решение по кандидату-поставщику. `PROPOSED` — найден автоматически, решение не принято;
+        `CONFIRMED` — оставлен менеджером; `REJECTED` — исключён менеджером.
+        В расчёт оценки и в рассылку входят `PROPOSED` и `CONFIRMED`; `REJECTED` исключается.
+      enum: [PROPOSED, CONFIRMED, REJECTED]
+    SupplierSource:
+      type: string
+      description: Источник поставщика (`TAVILY` — найден поиском, `MANUAL` — добавлен менеджером)
+      enum: [TAVILY, MANUAL]
+    Confidence:
+      type: string
+      description: |
+        Уровень уверенности. Для оценки стоимости определяется долей позиций с найденной ценой (BR-003):
+        менее 40% — `LOW`, 40–70% — `MEDIUM`, более 70% — `HIGH`.
+      enum: [LOW, MEDIUM, HIGH]
+    DraftStatus:
+      type: string
+      description: Статус письма в интерфейсе (FR-016)
+      enum: [DRAFT, QUEUED, SENT, FAILED]
+    MessageStatus:
+      type: string
+      description: Статус отправки сообщения mailer-service
+      enum: [QUEUED, SENT, FAILED]
+    ErrorCode:
+      type: string
+      description: |
+        Машинный код ошибки.
+        `VALIDATION_ERROR` — параметры запроса некорректны;
+        `RD_INVALID_JSON` — файл не является корректным JSON;
+        `RD_INVALID_FIELD` — поле РД не прошло проверку;
+        `RD_EMPTY` — в РД нет позиций;
+        `FILE_TOO_LARGE` — файл больше лимита;
+        `UNSUPPORTED_MEDIA_TYPE` — неподдерживаемый тип файла;
+        `JOB_NOT_FOUND`, `CANDIDATE_NOT_FOUND`, `DRAFT_NOT_FOUND` — объект не найден;
+        `JOB_NOT_READY` — задача ещё не в статусе `READY`;
+        `NO_ACTIVE_SUPPLIERS` — нет поставщиков в статусах `PROPOSED` и `CONFIRMED`;
+        `SUPPLIER_DUPLICATE` — поставщик с таким доменом уже в задаче;
+        `DRAFT_NOT_EDITABLE` — письмо в очереди или отправлено, редактирование запрещено;
+        `DRAFT_ALREADY_QUEUED` — письмо уже в очереди или отправлено, повторная постановка запрещена;
+        `DRAFT_NOT_SENDABLE` — у поставщика нет e-mail;
+        `DRAFT_NOT_FAILED` — повтор доступен только для письма с ошибкой;
+        `QUEUE_UNAVAILABLE` — очередь отправки недоступна;
+        `INTERNAL_ERROR` — внутренняя ошибка.
+      enum:
+        - VALIDATION_ERROR
+        - RD_INVALID_JSON
+        - RD_INVALID_FIELD
+        - RD_EMPTY
+        - FILE_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - JOB_NOT_FOUND
+        - CANDIDATE_NOT_FOUND
+        - DRAFT_NOT_FOUND
+        - JOB_NOT_READY
+        - NO_ACTIVE_SUPPLIERS
+        - SUPPLIER_DUPLICATE
+        - DRAFT_NOT_EDITABLE
+        - DRAFT_ALREADY_QUEUED
+        - DRAFT_NOT_SENDABLE
+        - DRAFT_NOT_FAILED
+        - QUEUE_UNAVAILABLE
+        - INTERNAL_ERROR
+
+    # ------------------------------------------------------------------ ошибки и служебное
+
+    ErrorDetail:
+      type: object
+      description: Деталь ошибки, привязанная к полю запроса или файла
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: "Путь к полю: параметр запроса, поле тела или путь в РД (например `products[12].quantity`)"
+          example: products[12].quantity
+        message:
+          type: string
+          description: Описание проблемы для пользователя
+    ErrorResponse:
+      type: object
+      description: Единый формат ошибки
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          description: Описание ошибки для пользователя; не содержит внутренних деталей и секретов
+        details:
+          type: array
+          description: Ошибки по отдельным полям; пусто, если ошибка не связана с конкретным полем
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+    HealthResponse:
+      type: object
+      required: [status, service]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+          example: sourcing-service
+    DependencyStatus:
+      type: object
+      required: [name, status]
+      properties:
+        name:
+          type: string
+          description: Имя зависимости
+          example: postgres
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        required:
+          type: boolean
+          description: Влияет ли недоступность зависимости на готовность сервиса
+    ReadyResponse:
+      type: object
+      required: [status, dependencies]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        dependencies:
+          type: array
+          items:
+            $ref: "#/components/schemas/DependencyStatus"
+
+    # ------------------------------------------------------------------ задачи
+
+    JobCreateRequest:
+      type: object
+      description: Параметры создания задачи (multipart/form-data)
+      required: [file, name, region, language]
+      properties:
+        file:
+          type: string
+          format: binary
+          description: Файл РД — JSON-объект с массивом `products`; не более 10 МБ
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '^[^\r\n]+$'
+          description: Название тендера; попадает в тему и текст писем; переводы строк запрещены
+        region:
+          $ref: "#/components/schemas/Region"
+        language:
+          $ref: "#/components/schemas/Language"
+        marginPercent:
+          type: number
+          minimum: 0
+          maximum: 100
+          default: 20
+          description: Маржа подрядчика в процентах (по умолчанию 20)
+    StageProgress:
+      type: object
+      description: Прогресс одного этапа обработки
+      required: [stage, status]
+      properties:
+        stage:
+          $ref: "#/components/schemas/StageName"
+        status:
+          $ref: "#/components/schemas/StageStatus"
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        message:
+          type: string
+          nullable: true
+          description: Причина частичного результата или сбоя (REL-001)
+    TenderJob:
+      type: object
+      description: Задача обработки РД (сущность TENDER_JOB; не называется `Job`, чтобы не конфликтовать с `kotlinx.coroutines.Job`)
+      required: [id, name, region, language, marginPercent, status, positionsCount, categoriesCount, stages, warnings, failureReason, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        region:
+          $ref: "#/components/schemas/Region"
+        language:
+          $ref: "#/components/schemas/Language"
+        marginPercent:
+          type: number
+          description: Процент маржи, заданный при создании; после создания не изменяется (для расчёта с другой маржой служит параметр `margin` операции `getJobEstimate`)
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        positionsCount:
+          type: integer
+          description: Число позиций РД
+        categoriesCount:
+          type: integer
+          description: Число категорий РД
+        stages:
+          type: array
+          description: Прогресс по этапам в порядке выполнения
+          items:
+            $ref: "#/components/schemas/StageProgress"
+        warnings:
+          type: array
+          description: Предупреждения о частичных сбоях внешних сервисов; пусто, если сбоев не было
+          items:
+            type: string
+        failureReason:
+          type: string
+          nullable: true
+          description: Причина ошибки; заполнено только для статуса `FAILED`
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    JobList:
+      type: object
+      description: Страница списка задач
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TenderJob"
+        total:
+          type: integer
+          description: Общее число задач
+        limit:
+          type: integer
+        offset:
+          type: integer
+    CategoryPage:
+      type: object
+      description: Страница списка (`Category`)
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Category"
+        total:
+          type: integer
+          description: Общее число элементов
+        limit:
+          type: integer
+        offset:
+          type: integer
+    SupplierCandidatePage:
+      type: object
+      description: Страница списка (`SupplierCandidate`)
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SupplierCandidate"
+        total:
+          type: integer
+          description: Общее число элементов
+        limit:
+          type: integer
+        offset:
+          type: integer
+    ExchangeRatePage:
+      type: object
+      description: Страница списка (`ExchangeRate`)
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExchangeRate"
+        total:
+          type: integer
+          description: Общее число элементов
+        limit:
+          type: integer
+        offset:
+          type: integer
+    RfqDraftPage:
+      type: object
+      description: Страница списка (`RfqDraft`)
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/RfqDraft"
+        total:
+          type: integer
+          description: Общее число элементов
+        limit:
+          type: integer
+        offset:
+          type: integer
+    RfqMessagePage:
+      type: object
+      description: Страница списка (`RfqMessage`)
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/RfqMessage"
+        total:
+          type: integer
+          description: Общее число элементов
+        limit:
+          type: integer
+        offset:
+          type: integer
+    Subcategory:
+      type: object
+      description: Подкатегория РД (`group_ksr`)
+      required: [name, positionsCount]
+      properties:
+        name:
+          type: string
+        positionsCount:
+          type: integer
+    Category:
+      type: object
+      description: Категория РД (`group`)
+      required: [id, name, positionsCount, subcategories]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Радиаторы отопления
+        positionsCount:
+          type: integer
+        subcategories:
+          type: array
+          items:
+            $ref: "#/components/schemas/Subcategory"
+
+    # ------------------------------------------------------------------ поставщики
+
+    Supplier:
+      type: object
+      description: "Поставщик из единого реестра (одна запись на домен сайта), существует независимо от задач и переиспользуется между тендерами; `email` и `source` общие для всех задач"
+      required: [id, name, website, email, phone, region, source, pricesSyncedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        website:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https?://[^\s]+$'
+          description: Сайт поставщика; домен используется для объединения дубликатов (FR-007)
+        email:
+          type: string
+          format: email
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        region:
+          $ref: "#/components/schemas/Region"
+        source:
+          $ref: "#/components/schemas/SupplierSource"
+        pricesSyncedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Момент получения прайс-листа; `null`, если прайс-лист не получен
+    CategoryCoverage:
+      type: object
+      description: Покрытие категории РД поставщиком
+      required: [categoryId, categoryName, coveredPositions, confidence]
+      properties:
+        categoryId:
+          type: string
+          format: uuid
+        categoryName:
+          type: string
+        coveredPositions:
+          type: integer
+          description: Примерное число позиций категории, которые поставщик может закрыть
+        confidence:
+          $ref: "#/components/schemas/Confidence"
+    SupplierCandidate:
+      type: object
+      description: Кандидат-поставщик в рамках задачи
+      required: [id, jobId, supplier, status, coveredPositions, coverage, avgPriceUsd, confidence, evidenceUrl]
+      properties:
+        id:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        supplier:
+          $ref: "#/components/schemas/Supplier"
+        status:
+          $ref: "#/components/schemas/CandidateStatus"
+        coveredPositions:
+          type: integer
+          description: Суммарное примерное число покрываемых позиций
+        coverage:
+          type: array
+          items:
+            $ref: "#/components/schemas/CategoryCoverage"
+        avgPriceUsd:
+          type: number
+          nullable: true
+          description: Средняя цена по прайс-листу в USD; `null`, если прайс-лист не получен
+        confidence:
+          $ref: "#/components/schemas/Confidence"
+        evidenceUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https?://[^\s]+$'
+          nullable: true
+          description: Ссылка на страницу, по которой поставщик найден; `null` для добавленных вручную
+    AddSupplierRequest:
+      type: object
+      description: Поставщик, добавляемый менеджером вручную
+      required: [name, website, email]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        website:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https?://[^\s]+$'
+          description: |
+            Адрес сайта со схемой `http` или `https`. Сервер дополнительно отклоняет адреса с userinfo,
+            loopback/private/link-local адресами и нестандартными портами (защита от SSRF при передаче
+            в Price Parser Service)
+        email:
+          type: string
+          format: email
+          maxLength: 254
+    UpdateCandidateRequest:
+      type: object
+      description: Изменение кандидата; передаётся хотя бы одно поле
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        status:
+          $ref: "#/components/schemas/CandidateStatus"
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: E-mail поставщика
+
+    # ------------------------------------------------------------------ оценка стоимости
+
+    MoneyAmount:
+      type: object
+      description: Сумма в USD и в валюте региона (FR-012)
+      required: [usd, local, localCurrency]
+      properties:
+        usd:
+          type: number
+          description: Сумма в USD
+        local:
+          type: number
+          description: Сумма в валюте региона по курсу `Estimate.rate`
+        localCurrency:
+          $ref: "#/components/schemas/LocalCurrency"
+    EstimateLine:
+      type: object
+      description: Часть оценки по категории РД
+      required: [categoryId, categoryName, positionsCount, pricedPositions, subtotal]
+      properties:
+        categoryId:
+          type: string
+          format: uuid
+        categoryName:
+          type: string
+        positionsCount:
+          type: integer
+        pricedPositions:
+          type: integer
+          description: Число позиций категории, для которых найдена цена
+        subtotal:
+          $ref: "#/components/schemas/MoneyAmount"
+    Estimate:
+      type: object
+      description: |
+        Оценка порядка стоимости по активным поставщикам — `PROPOSED` и `CONFIRMED` (BR-002). Итог = базовая сумма + маржа;
+        маржа = базовая сумма × процент маржи. Диапазон строится по нижней и верхней квартилям цен.
+        Оценка — ориентир порядка величины, а не ценовое предложение (BR-005).
+      required: [jobId, marginPercent, baseTotal, margin, total, low, high, confidence, pricedPositions, totalPositions, pricedShare, lines, rate, calculatedAt]
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        marginPercent:
+          type: number
+          description: Процент маржи, использованный в расчёте
+        baseTotal:
+          $ref: "#/components/schemas/MoneyAmount"
+        margin:
+          $ref: "#/components/schemas/MoneyAmount"
+        total:
+          $ref: "#/components/schemas/MoneyAmount"
+        low:
+          $ref: "#/components/schemas/MoneyAmount"
+        high:
+          $ref: "#/components/schemas/MoneyAmount"
+        confidence:
+          $ref: "#/components/schemas/Confidence"
+        pricedPositions:
+          type: integer
+          description: Число позиций РД, для которых найдена цена
+        totalPositions:
+          type: integer
+          description: Общее число позиций РД
+        pricedShare:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Доля позиций с найденной ценой (0…1); по ней определяется `confidence`
+        lines:
+          type: array
+          description: Разбивка по категориям
+          items:
+            $ref: "#/components/schemas/EstimateLine"
+        rate:
+          type: number
+          description: Курс USD к валюте региона, использованный для пересчёта
+        calculatedAt:
+          type: string
+          format: date-time
+    ExchangeRate:
+      type: object
+      description: Курс USD к валюте региона из справочника
+      required: [currency, rate, updatedAt]
+      properties:
+        currency:
+          $ref: "#/components/schemas/LocalCurrency"
+        rate:
+          type: number
+          description: Сколько единиц валюты приходится на 1 USD
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ------------------------------------------------------------------ письма
+
+    RfqPosition:
+      type: object
+      description: Позиция РД в письме-запросе (BR-004)
+      required: [itemIndex, rawName, quantity, categoryName]
+      properties:
+        itemIndex:
+          type: integer
+          description: Номер позиции в РД
+        detailNumber:
+          type: string
+          nullable: true
+          description: Артикул
+        rawName:
+          type: string
+        quantity:
+          type: number
+        categoryName:
+          type: string
+    RfqDraft:
+      type: object
+      description: Черновик письма-запроса КП поставщику
+      required: [id, jobId, candidateId, supplierName, toEmail, language, subject, body, positions, status, sendable, notSendableReason]
+      properties:
+        id:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        candidateId:
+          type: string
+          format: uuid
+        supplierName:
+          type: string
+        toEmail:
+          type: string
+          format: email
+          nullable: true
+          description: Получатель; `null`, если у поставщика нет e-mail
+        language:
+          $ref: "#/components/schemas/Language"
+        subject:
+          type: string
+        body:
+          type: string
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RfqPosition"
+        status:
+          $ref: "#/components/schemas/DraftStatus"
+        sendable:
+          type: boolean
+          description: Можно ли отправить письмо; `false`, если нет e-mail или письмо уже в очереди либо отправлено
+        notSendableReason:
+          type: string
+          nullable: true
+          description: Причина, по которой письмо нельзя отправить
+    UpdateRfqDraftRequest:
+      type: object
+      description: Новые тема и текст письма
+      required: [subject, body]
+      additionalProperties: false
+      properties:
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: '^[^\r\n]+$'
+          description: Тема письма; переводы строк запрещены (защита от header injection)
+        body:
+          type: string
+          minLength: 1
+          maxLength: 100000
+          description: Текст письма в формате text/plain. Срок ответа программно не задаётся — оператор при необходимости указывает его сам, редактируя черновик
+    SendRfqRequest:
+      type: object
+      description: Черновики, выбранные для отправки
+      required: [draftIds]
+      additionalProperties: false
+      properties:
+        draftIds:
+          type: array
+          minItems: 1
+          maxItems: 500
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+    RfqMessage:
+      type: object
+      description: |
+        Сообщение, поставленное в очередь отправки. У одного черновика может быть несколько сообщений
+        (первая отправка и повторы после ошибки, связь 0..N); они различаются `attemptNo`.
+      required: [id, draftId, attemptNo, candidateId, supplierName, toEmail, status, attempts, error, queuedAt, sentAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор письма; ключ идемпотентности в Kafka (REL-002)
+        draftId:
+          type: string
+          format: uuid
+        attemptNo:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Порядковый номер постановки черновика в очередь (1 — первая отправка, 2 — первый повтор и т.д.)
+        candidateId:
+          type: string
+          format: uuid
+        supplierName:
+          type: string
+        toEmail:
+          type: string
+          format: email
+        status:
+          $ref: "#/components/schemas/MessageStatus"
+        attempts:
+          type: integer
+          description: Число попыток отправки (до 3)
+        error:
+          type: string
+          nullable: true
+          description: Причина ошибки; заполнено для статуса `FAILED`
+        queuedAt:
+          type: string
+          format: date-time
+        sentAt:
+          type: string
+          format: date-time
+          nullable: true
+    SendRfqResponse:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/RfqMessage"
+
+    # ------------------------------------------------------------------ события Kafka (не REST)
+
+    RfqSendRequestedEvent:
+      type: object
+      description: |
+        Событие Kafka `rfq.send.requested` (sourcing-service → mailer-service). Не является REST-вызовом;
+        описано для генерации моделей и единого источника схем. Повторная доставка не приводит к повторной
+        отправке: mailer-service дедуплицирует по `messageId` (REL-002).
+      required: [messageId, draftId, to, subject, body, language]
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        draftId:
+          type: string
+          format: uuid
+        to:
+          type: string
+          format: email
+        subject:
+          type: string
+        body:
+          type: string
+        language:
+          $ref: "#/components/schemas/Language"
+    RfqStatusChangedEvent:
+      type: object
+      description: |
+        Событие Kafka `rfq.status.changed` (mailer-service → sourcing-service). Не является REST-вызовом.
+      required: [messageId, status, attempts, occurredAt]
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [SENT, FAILED]
+        attempts:
+          type: integer
+        error:
+          type: string
+          nullable: true
+          description: Причина ошибки для статуса `FAILED`
+        occurredAt:
+          type: string
+          format: date-time
